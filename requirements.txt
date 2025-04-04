@@ -1,0 +1,6 @@
+argparse
+python-nmap
+requests
+colorama
+tabulate
+tqdm
