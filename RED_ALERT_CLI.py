@@ -305,14 +305,47 @@ class VulnerabilityScanner:
     
     def save_report(self, output_file, format_type):
         """Save the scan report to a file in the specified format"""
-        if format_type.lower() == 'txt':
-            self.save_txt_report(output_file)
-        elif format_type.lower() == 'json':
-            self.save_json_report(output_file)
-        elif format_type.lower() == 'html':
-            self.save_html_report(output_file)
-        else:
-            print(f"{Fore.RED}[!] Unsupported report format: {format_type}{Style.RESET_ALL}")
+        # Validate format type
+        valid_formats = ['txt', 'json', 'html']
+        if format_type.lower() not in valid_formats:
+            print(f"{Fore.RED}[!] Unsupported report format: {format_type}. Using txt format instead.{Style.RESET_ALL}")
+            format_type = 'txt'
+        
+        # Create directory if it doesn't exist
+        output_dir = os.path.dirname(output_file)
+        if output_dir and not os.path.exists(output_dir):
+            try:
+                os.makedirs(output_dir)
+                print(f"{Fore.BLUE}[*] Created directory: {output_dir}{Style.RESET_ALL}")
+            except OSError as e:
+                print(f"{Fore.RED}[!] Error creating directory {output_dir}: {str(e)}{Style.RESET_ALL}")
+                print(f"{Fore.RED}[!] Report will be saved in the current directory{Style.RESET_ALL}")
+                output_file = os.path.basename(output_file)
+        
+        # Check if file already exists
+        if os.path.exists(output_file):
+            print(f"{Fore.YELLOW}[!] Warning: File {output_file} already exists and will be overwritten{Style.RESET_ALL}")
+        
+        # Save report in the specified format
+        print(f"{Fore.BLUE}[*] Saving report in {format_type.upper()} format to {output_file}...{Style.RESET_ALL}")
+        
+        try:
+            if format_type.lower() == 'txt':
+                self.save_txt_report(output_file)
+            elif format_type.lower() == 'json':
+                self.save_json_report(output_file)
+            elif format_type.lower() == 'html':
+                self.save_html_report(output_file)
+            
+            # Verify file was created
+            if os.path.exists(output_file):
+                file_size = os.path.getsize(output_file)
+                print(f"{Fore.GREEN}[+] Report successfully saved to {output_file} ({file_size} bytes){Style.RESET_ALL}")
+                print(f"{Fore.GREEN}[+] You can access the report at: {os.path.abspath(output_file)}{Style.RESET_ALL}")
+            else:
+                print(f"{Fore.RED}[!] Error: Report file was not created{Style.RESET_ALL}")
+        except Exception as e:
+            print(f"{Fore.RED}[!] Error saving report: {str(e)}{Style.RESET_ALL}")
     
     def save_txt_report(self, output_file):
         """Save the scan report in plain text format"""
@@ -398,10 +431,8 @@ class VulnerabilityScanner:
                 
                 # Restore stdout
                 sys.stdout = original_stdout
-                
-            print(f"{Fore.GREEN}[+] Report saved to {output_file}{Style.RESET_ALL}")
         except Exception as e:
-            print(f"{Fore.RED}[!] Error saving TXT report: {str(e)}{Style.RESET_ALL}")
+            raise Exception(f"Error saving TXT report: {str(e)}")
     
     def save_json_report(self, output_file):
         """Save the scan report in JSON format"""
@@ -422,10 +453,8 @@ class VulnerabilityScanner:
             
             with open(output_file, 'w') as f:
                 json.dump(report, f, indent=4)
-            
-            print(f"{Fore.GREEN}[+] Report saved to {output_file}{Style.RESET_ALL}")
         except Exception as e:
-            print(f"{Fore.RED}[!] Error saving JSON report: {str(e)}{Style.RESET_ALL}")
+            raise Exception(f"Error saving JSON report: {str(e)}")
     
     def save_html_report(self, output_file):
         """Save the scan report in HTML format"""
@@ -511,11 +540,36 @@ class VulnerabilityScanner:
             font-size: 0.8em;
             color: #7f8c8d;
         }}
+        .download-section {{
+            text-align: center;
+            margin: 20px 0;
+        }}
+        .download-btn {{
+            display: inline-block;
+            padding: 10px 20px;
+            background-color: #3498db;
+            color: white;
+            text-decoration: none;
+            border-radius: 5px;
+            font-weight: bold;
+        }}
+        .download-btn:hover {{
+            background-color: #2980b9;
+        }}
+        @media print {{
+            .download-section {{
+                display: none;
+            }}
+        }}
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Vulnerability Scan Report</h1>
+        
+        <div class="download-section">
+            <button class="download-btn" onclick="window.print()">Print/Save as PDF</button>
+        </div>
         
         <div class="section">
             <h2>Scan Information</h2>
@@ -619,6 +673,9 @@ class VulnerabilityScanner:
             <div class="port-header">
                 <h3>Port {port} - {html.escape(service['name'])} - {html.escape(service['product'])} {html.escape(service['version'])}</h3>
             </div>
+              {html.escape(service['version'])}</h3>
+            </div>
+            
             <table>
                 <tr>
                     <th>CVE ID</th>
@@ -660,19 +717,25 @@ class VulnerabilityScanner:
             # Footer
             html_content += f"""
         <div class="footer">
-            <p>Report generated on {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")} by Vulnerability Scanner</p>
+            <p>Report generated on {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")} by RED ALERT CLI Vulnerability Scanner</p>
         </div>
     </div>
+    
+    <script>
+        // Add event listener for download button
+        document.addEventListener('DOMContentLoaded', function() {{
+            // This script enables the print/save functionality
+            console.log('Report loaded successfully');
+        }});
+    </script>
 </body>
 </html>
 """
             
             with open(output_file, 'w') as f:
                 f.write(html_content)
-            
-            print(f"{Fore.GREEN}[+] Report saved to {output_file}{Style.RESET_ALL}")
         except Exception as e:
-            print(f"{Fore.RED}[!] Error saving HTML report: {str(e)}{Style.RESET_ALL}")
+            raise Exception(f"Error saving HTML report: {str(e)}")
 
 
 def print_banner():
@@ -691,7 +754,7 @@ def print_banner():
 """
     print(banner)
     print(f"{Fore.YELLOW}A comprehensive vulnerability scanning tool{Style.RESET_ALL}")
-    print(f"{Fore.YELLOW}Version 1.1.0{Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}Version 1.2.0{Style.RESET_ALL}")
     print("=" * 80)
 
 def main():
@@ -720,6 +783,9 @@ def main():
     # Save report if output file is specified
     if args.output:
         scanner.save_report(args.output, args.format)
+    else:
+        print(f"\n{Fore.YELLOW}[!] No output file specified. Report not saved.{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}[!] Use -o/--output option to save the report.{Style.RESET_ALL}")
 
 if __name__ == "__main__":
     main()
