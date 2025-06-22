@@ -51,8 +51,8 @@ sudo pacman -S python python-pip nmap exploitdb
 ### Step 2: Clone Repository
 
 \`\`\`bash
-git clone https://github.com/yourusername/red-alert-cli.git
-cd red-alert-cli
+git clone https://github.com/BreakingRohit/RED_ALERT_CLI.git
+cd RED_ALERT_CLI
 \`\`\`
 
 ### Step 3: Install Python Dependencies
