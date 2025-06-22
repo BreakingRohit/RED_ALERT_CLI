@@ -4,3 +4,4 @@ requests
 colorama
 tabulate
 tqdm
+urlib3
