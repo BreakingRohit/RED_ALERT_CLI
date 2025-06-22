@@ -14,21 +14,31 @@ from tabulate import tabulate
 from tqdm import tqdm
 import html
 
+# Import our OWASP scanner module
+from owasp_scanner import OWASPScanner, get_exploit_info, search_additional_exploits
+
 # Initialize colorama for cross-platform colored terminal output
 init()
 
 class VulnerabilityScanner:
-    def __init__(self, target, ports=None, threads=10, timeout=2):
+    def __init__(self, target, ports=None, threads=10, timeout=2, enable_owasp=False):
         self.target = target
-        self.ports = ports or "1-1000"  # Default scan first 1000 ports if not specified
+        self.ports = ports or "1-1000"
         self.threads = threads
         self.timeout = timeout
+        self.enable_owasp = enable_owasp
         self.nm = nmap.PortScanner()
         self.open_ports = []
         self.service_info = {}
         self.vulnerabilities = {}
+        self.web_vulnerabilities = []
+        self.service_exploits = {}  # Store service-specific exploits
         self.scan_start_time = None
         self.scan_end_time = None
+        
+        # Initialize OWASP scanner if enabled
+        if self.enable_owasp:
+            self.owasp_scanner = OWASPScanner(target, timeout=timeout)
         
     def resolve_host(self):
         """Resolve hostname to IP address"""
@@ -63,13 +73,11 @@ class VulnerabilityScanner:
         # Use ThreadPoolExecutor with tqdm progress bar for parallel scanning
         with tqdm(total=len(port_list), desc="Scanning ports", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]") as pbar:
             with ThreadPoolExecutor(max_workers=self.threads) as executor:
-                # Create a list to store results and ports
                 results = []
                 for port in port_list:
                     future = executor.submit(self.is_port_open, port)
                     results.append((port, future))
                 
-                # Process results as they complete
                 for port, future in results:
                     is_open = future.result()
                     if is_open:
@@ -88,17 +96,15 @@ class VulnerabilityScanner:
         
         print(f"{Fore.BLUE}[*] Starting detailed service scan on open ports...{Style.RESET_ALL}")
         
-        # Convert list of ports to nmap format
         ports_str = ",".join(map(str, self.open_ports))
         
         try:
-            # Run nmap scan with service detection and show progress
             print(f"{Fore.BLUE}[*] Running Nmap service detection...{Style.RESET_ALL}")
             with tqdm(total=len(self.open_ports), desc="Identifying services", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]") as pbar:
                 self.nm.scan(self.target, ports=ports_str, arguments="-sV")
                 pbar.update(len(self.open_ports))
             
-            # Process results
+            # Process service information and search for exploits
             for port in self.open_ports:
                 port = str(port)
                 if self.target in self.nm.all_hosts() and 'tcp' in self.nm[self.target] and int(port) in self.nm[self.target]['tcp']:
@@ -109,7 +115,19 @@ class VulnerabilityScanner:
                         'version': service_info.get('version', ''),
                         'extrainfo': service_info.get('extrainfo', '')
                     }
-                    print(f"{Fore.GREEN}[+] Port {port}: {self.service_info[port]['name']} - {self.service_info[port]['product']} {self.service_info[port]['version']} {self.service_info[port]['extrainfo']}{Style.RESET_ALL}")
+                    
+                    # Search for service-specific exploits
+                    if self.service_info[port]['product']:
+                        service_exploits = search_additional_exploits(
+                            self.service_info[port]['product'], 
+                            self.service_info[port]['version']
+                        )
+                        
+                        if service_exploits:
+                            self.service_exploits[port] = service_exploits
+                            print(f"{Fore.GREEN}[+] Found {len(service_exploits)} service exploits for {self.service_info[port]['product']} on port {port}{Style.RESET_ALL}")
+                    
+                    print(f"{Fore.GREEN}[+] Port {port}: {self.service_info[port]['name']} - {self.service_info[port]['product']} {self.service_info[port]['version']}{Style.RESET_ALL}")
         except Exception as e:
             print(f"{Fore.RED}[!] Error during detailed scan: {str(e)}{Style.RESET_ALL}")
     
@@ -118,10 +136,9 @@ class VulnerabilityScanner:
         if not self.service_info:
             return
         
-        print(f"{Fore.BLUE}[*] Checking for vulnerabilities...{Style.RESET_ALL}")
+        print(f"{Fore.BLUE}[*] Checking for CVE vulnerabilities...{Style.RESET_ALL}")
         
-        # Create progress bar for vulnerability checking
-        with tqdm(total=len(self.service_info), desc="Checking vulnerabilities", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]") as pbar:
+        with tqdm(total=len(self.service_info), desc="Checking CVEs", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]") as pbar:
             for port, service in self.service_info.items():
                 product = service['product']
                 version = service['version']
@@ -131,33 +148,75 @@ class VulnerabilityScanner:
                     continue
                     
                 # Query the NVD API for vulnerabilities
-                self.vulnerabilities[port] = self.query_nvd(product, version)
+                cve_vulns = self.query_nvd(product, version)
+                
+                # FIXED: Add exploit information to each CVE
+                for vuln in cve_vulns:
+                    print(f"{Fore.BLUE}[*] Searching exploits for {vuln['cve_id']}...{Style.RESET_ALL}")
+                    vuln['exploits'] = get_exploit_info(vuln['cve_id'])
+                    
+                    # FIXED: Show exploit count immediately
+                    if vuln['exploits']:
+                        print(f"{Fore.GREEN}[+] Found {len(vuln['exploits'])} exploits for {vuln['cve_id']}:{Style.RESET_ALL}")
+                        for i, exploit in enumerate(vuln['exploits'][:3], 1):
+                            print(f"{Fore.GREEN}    {i}. {exploit['name'][:50]}...{Style.RESET_ALL}")
+                    else:
+                        print(f"{Fore.YELLOW}[!] No exploits found for {vuln['cve_id']}{Style.RESET_ALL}")
+                
+                self.vulnerabilities[port] = cve_vulns
                 
                 if self.vulnerabilities[port]:
-                    print(f"{Fore.GREEN}[+] Found {len(self.vulnerabilities[port])} vulnerabilities for {product} {version} on port {port}{Style.RESET_ALL}")
+                    print(f"{Fore.GREEN}[+] Found {len(self.vulnerabilities[port])} CVEs for {product} {version} on port {port}{Style.RESET_ALL}")
                 else:
-                    print(f"{Fore.YELLOW}[!] No known vulnerabilities found for {product} {version} on port {port}{Style.RESET_ALL}")
+                    print(f"{Fore.YELLOW}[!] No known CVEs found for {product} {version} on port {port}{Style.RESET_ALL}")
                 
                 pbar.update(1)
+    
+    def run_owasp_scan(self):
+        """Run OWASP Top 10 vulnerability scan on web services"""
+        if not self.enable_owasp:
+            return
+        
+        print(f"{Fore.CYAN}[*] Starting OWASP Top 10 vulnerability scan...{Style.RESET_ALL}")
+        
+        # Find web services
+        web_ports = []
+        for port in self.open_ports:
+            if self.owasp_scanner.is_web_service(port):
+                web_ports.append(port)
+        
+        if not web_ports:
+            print(f"{Fore.YELLOW}[!] No web services detected for OWASP scanning{Style.RESET_ALL}")
+            return
+        
+        print(f"{Fore.BLUE}[*] Found {len(web_ports)} web services: {', '.join(map(str, web_ports))}{Style.RESET_ALL}")
+        
+        # Run OWASP scan on each web service
+        for port in web_ports:
+            vulnerabilities = self.owasp_scanner.run_owasp_scan(port)
+            if vulnerabilities:
+                self.web_vulnerabilities.extend(vulnerabilities)
+                print(f"{Fore.GREEN}[+] Found {len(vulnerabilities)} web vulnerabilities on port {port}{Style.RESET_ALL}")
+                
+                # FIXED: Show OWASP vulnerabilities immediately
+                for vuln in vulnerabilities:
+                    print(f"{Fore.RED}  [!] {vuln['type']}: {vuln['parameter']} -> {vuln['payload'][:30]}...{Style.RESET_ALL}")
     
     def query_nvd(self, product, version):
         """Query the NVD database for vulnerabilities"""
         vulnerabilities = []
         
         try:
-            # Format the search query
             search_term = f"{product}"
             if version:
                 search_term += f" {version}"
                 
-            # Use the NVD API to search for vulnerabilities
             url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={search_term}&resultsPerPage=10"
-            response = requests.get(url)
+            response = requests.get(url, timeout=10)
             
             if response.status_code == 200:
                 data = response.json()
                 
-                # Process the results
                 if 'vulnerabilities' in data:
                     for vuln in data['vulnerabilities']:
                         cve_item = vuln['cve']
@@ -177,18 +236,42 @@ class VulnerabilityScanner:
                             elif 'cvssMetricV2' in metrics and metrics['cvssMetricV2']:
                                 cvss_data = metrics['cvssMetricV2'][0]['cvssData']
                                 cvss_score = cvss_data.get('baseScore', 'N/A')
-                                severity = 'N/A'
+                        
+                        remediation = self.get_cve_remediation(description)
                         
                         vulnerabilities.append({
                             'cve_id': cve_id,
                             'description': description,
                             'cvss_score': cvss_score,
-                            'severity': severity
+                            'severity': severity,
+                            'remediation': remediation,
+                            'exploits': []  # Will be populated later
                         })
         except Exception as e:
             print(f"{Fore.RED}[!] Error querying NVD: {str(e)}{Style.RESET_ALL}")
         
         return vulnerabilities
+    
+    def get_cve_remediation(self, description):
+        """Get remediation suggestion based on CVE description"""
+        description_lower = description.lower()
+        
+        if 'buffer overflow' in description_lower:
+            return "Update to latest version. Implement proper input validation and bounds checking."
+        elif 'sql injection' in description_lower:
+            return "Use parameterized queries. Validate and sanitize all user inputs."
+        elif 'cross-site scripting' in description_lower or 'xss' in description_lower:
+            return "Implement proper input validation and output encoding. Use Content Security Policy."
+        elif 'authentication' in description_lower:
+            return "Implement strong authentication mechanisms. Use multi-factor authentication."
+        elif 'privilege escalation' in description_lower:
+            return "Apply principle of least privilege. Update to patched version."
+        elif 'denial of service' in description_lower or 'dos' in description_lower:
+            return "Implement rate limiting and input validation. Update to latest version."
+        elif 'remote code execution' in description_lower or 'rce' in description_lower:
+            return "CRITICAL: Update immediately. Restrict network access if possible."
+        else:
+            return "Update to the latest patched version. Follow vendor security advisories."
     
     def run_scan(self):
         """Run the full vulnerability scan"""
@@ -205,6 +288,10 @@ class VulnerabilityScanner:
         if self.open_ports:
             self.detailed_scan()
             self.check_vulnerabilities()
+            
+            # Run OWASP scan if enabled
+            if self.enable_owasp:
+                self.run_owasp_scan()
         
         self.scan_end_time = datetime.datetime.now()
         
@@ -224,11 +311,11 @@ class VulnerabilityScanner:
         self.print_console_report()
     
     def print_console_report(self):
-        """Print a formatted report to the console"""
+        """FIXED: Print a formatted report to the console with proper exploit display"""
         scan_duration = (self.scan_end_time - self.scan_start_time).total_seconds()
         
         print("\n" + "=" * 80)
-        print(f"{Fore.CYAN}VULNERABILITY SCAN REPORT{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}🚨 RED ALERT CLI - VULNERABILITY SCAN REPORT{Style.RESET_ALL}")
         print("=" * 80)
         
         # Print scan information
@@ -239,7 +326,8 @@ class VulnerabilityScanner:
             ["Scan End Time", self.scan_end_time.strftime("%Y-%m-%d %H:%M:%S")],
             ["Duration", f"{scan_duration:.2f} seconds"],
             ["Ports Scanned", self.ports],
-            ["Open Ports Found", len(self.open_ports)]
+            ["Open Ports Found", len(self.open_ports)],
+            ["OWASP Scan", "Enabled" if self.enable_owasp else "Disabled"]
         ]
         print(tabulate(scan_info, tablefmt="pretty"))
         
@@ -267,18 +355,17 @@ class VulnerabilityScanner:
         
         print(tabulate(port_data, headers=["Port", "Service", "Product", "Version", "Extra Info"], tablefmt="pretty"))
         
-        # Print vulnerabilities
-        print(f"\n{Fore.CYAN}VULNERABILITIES:{Style.RESET_ALL}")
+        # FIXED: Print CVE vulnerabilities with exploits
+        print(f"\n{Fore.CYAN}CVE VULNERABILITIES:{Style.RESET_ALL}")
         
-        vuln_found = False
+        cve_found = False
         for port in self.open_ports:
             port_str = str(port)
             if port_str in self.vulnerabilities and self.vulnerabilities[port_str]:
-                vuln_found = True
+                cve_found = True
                 service = self.service_info.get(port_str, {'name': 'Unknown', 'product': '', 'version': ''})
                 print(f"\n{Fore.YELLOW}Port {port} - {service['name']} - {service['product']} {service['version']}{Style.RESET_ALL}")
                 
-                vuln_data = []
                 for vuln in self.vulnerabilities[port_str]:
                     severity_color = Fore.GREEN
                     if vuln['severity'] == 'HIGH':
@@ -286,22 +373,57 @@ class VulnerabilityScanner:
                     elif vuln['severity'] == 'MEDIUM':
                         severity_color = Fore.YELLOW
                     
-                    # Truncate description if too long
-                    description = vuln['description']
-                    if len(description) > 100:
-                        description = description[:97] + "..."
+                    print(f"  {Fore.RED}CVE: {vuln['cve_id']}{Style.RESET_ALL}")
+                    print(f"  {severity_color}Severity: {vuln['severity']} (CVSS: {vuln['cvss_score']}){Style.RESET_ALL}")
+                    print(f"  Description: {vuln['description'][:100]}...")
+                    print(f"  {Fore.BLUE}Remediation: {vuln['remediation']}{Style.RESET_ALL}")
                     
-                    vuln_data.append([
-                        f"{Fore.RED}{vuln['cve_id']}{Style.RESET_ALL}",
-                        f"{severity_color}{vuln['cvss_score']}{Style.RESET_ALL}",
-                        f"{severity_color}{vuln['severity']}{Style.RESET_ALL}",
-                        description
-                    ])
-                
-                print(tabulate(vuln_data, headers=["CVE ID", "CVSS Score", "Severity", "Description"], tablefmt="pretty"))
+                    # FIXED: Show exploits properly
+                    if vuln['exploits']:
+                        print(f"  {Fore.MAGENTA}🔥 Available Exploits ({len(vuln['exploits'])}):{Style.RESET_ALL}")
+                        for i, exploit in enumerate(vuln['exploits'][:5], 1):
+                            print(f"    {Fore.GREEN}{i}. {exploit['name']}{Style.RESET_ALL}")
+                            print(f"       {Fore.CYAN}Path: {exploit['path']}{Style.RESET_ALL}")
+                            if exploit.get('type') != 'Unknown':
+                                print(f"       {Fore.CYAN}Type: {exploit['type']}{Style.RESET_ALL}")
+                        if len(vuln['exploits']) > 5:
+                            print(f"    {Fore.YELLOW}... and {len(vuln['exploits']) - 5} more exploits{Style.RESET_ALL}")
+                    else:
+                        print(f"  {Fore.CYAN}ℹ️  No public exploits found{Style.RESET_ALL}")
+                    print()
         
-        if not vuln_found:
-            print(f"{Fore.GREEN}No vulnerabilities found for any service.{Style.RESET_ALL}")
+        # FIXED: Print service-specific exploits
+        if hasattr(self, 'service_exploits') and self.service_exploits:
+            print(f"\n{Fore.CYAN}SERVICE-SPECIFIC EXPLOITS:{Style.RESET_ALL}")
+            for port, exploits in self.service_exploits.items():
+                service = self.service_info.get(port, {'product': 'Unknown'})
+                print(f"\n{Fore.YELLOW}Port {port} - {service['product']}:{Style.RESET_ALL}")
+                for i, exploit in enumerate(exploits, 1):
+                    print(f"  {Fore.GREEN}{i}. {exploit['name']}{Style.RESET_ALL}")
+                    print(f"     {Fore.CYAN}Path: {exploit['path']}{Style.RESET_ALL}")
+        
+        if not cve_found:
+            print(f"{Fore.GREEN}No CVE vulnerabilities found for any service.{Style.RESET_ALL}")
+        
+        # FIXED: Print OWASP vulnerabilities properly
+        if self.enable_owasp and self.web_vulnerabilities:
+            print(f"\n{Fore.CYAN}OWASP TOP 10 VULNERABILITIES:{Style.RESET_ALL}")
+            
+            for vuln in self.web_vulnerabilities:
+                severity_color = Fore.GREEN
+                if vuln['severity'] == 'HIGH':
+                    severity_color = Fore.RED
+                elif vuln['severity'] == 'MEDIUM':
+                    severity_color = Fore.YELLOW
+                
+                print(f"\n{severity_color}[{vuln['severity']}] {vuln['type']}{Style.RESET_ALL}")
+                print(f"  {Fore.CYAN}URL: {vuln['url']}{Style.RESET_ALL}")
+                print(f"  {Fore.CYAN}Parameter: {vuln['parameter']}{Style.RESET_ALL}")
+                print(f"  {Fore.CYAN}Payload: {vuln['payload']}{Style.RESET_ALL}")
+                print(f"  {Fore.CYAN}Evidence: {vuln['evidence']}{Style.RESET_ALL}")
+                print(f"  {Fore.BLUE}Remediation: {vuln['remediation']}{Style.RESET_ALL}")
+        elif self.enable_owasp:
+            print(f"\n{Fore.GREEN}No OWASP vulnerabilities found.{Style.RESET_ALL}")
     
     def save_report(self, output_file, format_type):
         """Save the scan report to a file in the specified format"""
@@ -348,21 +470,16 @@ class VulnerabilityScanner:
             print(f"{Fore.RED}[!] Error saving report: {str(e)}{Style.RESET_ALL}")
     
     def save_txt_report(self, output_file):
-        """Save the scan report in plain text format"""
+        """FIXED: Save the scan report in plain text format with exploits"""
         try:
             with open(output_file, 'w') as f:
-                # Redirect stdout to the file
-                original_stdout = sys.stdout
-                sys.stdout = f
-                
-                # Generate a report without colors
                 scan_duration = (self.scan_end_time - self.scan_start_time).total_seconds()
                 
                 f.write("=" * 80 + "\n")
-                f.write("VULNERABILITY SCAN REPORT\n")
+                f.write("🚨 RED ALERT CLI - VULNERABILITY SCAN REPORT\n")
                 f.write("=" * 80 + "\n\n")
                 
-                # Print scan information
+                # Scan information
                 f.write("SCAN INFORMATION:\n")
                 scan_info = [
                     ["Target", self.target],
@@ -370,18 +487,17 @@ class VulnerabilityScanner:
                     ["Scan End Time", self.scan_end_time.strftime("%Y-%m-%d %H:%M:%S")],
                     ["Duration", f"{scan_duration:.2f} seconds"],
                     ["Ports Scanned", self.ports],
-                    ["Open Ports Found", len(self.open_ports)]
+                    ["Open Ports Found", len(self.open_ports)],
+                    ["OWASP Scan", "Enabled" if self.enable_owasp else "Disabled"]
                 ]
                 f.write(tabulate(scan_info, tablefmt="pretty") + "\n")
                 
                 if not self.open_ports:
                     f.write("\nNo open ports found.\n")
-                    sys.stdout = original_stdout
                     return
                 
-                # Print open ports and services
+                # Open ports and services
                 f.write("\nOPEN PORTS AND SERVICES:\n")
-                
                 port_data = []
                 for port in self.open_ports:
                     port_str = str(port)
@@ -399,43 +515,55 @@ class VulnerabilityScanner:
                 
                 f.write(tabulate(port_data, headers=["Port", "Service", "Product", "Version", "Extra Info"], tablefmt="pretty") + "\n")
                 
-                # Print vulnerabilities
-                f.write("\nVULNERABILITIES:\n")
-                
-                vuln_found = False
+                # FIXED: CVE vulnerabilities with exploits
+                f.write("\nCVE VULNERABILITIES:\n")
+                cve_found = False
                 for port in self.open_ports:
                     port_str = str(port)
                     if port_str in self.vulnerabilities and self.vulnerabilities[port_str]:
-                        vuln_found = True
+                        cve_found = True
                         service = self.service_info.get(port_str, {'name': 'Unknown', 'product': '', 'version': ''})
                         f.write(f"\nPort {port} - {service['name']} - {service['product']} {service['version']}\n")
                         
-                        vuln_data = []
                         for vuln in self.vulnerabilities[port_str]:
-                            # Truncate description if too long
-                            description = vuln['description']
-                            if len(description) > 100:
-                                description = description[:97] + "..."
+                            f.write(f"  CVE: {vuln['cve_id']}\n")
+                            f.write(f"  Severity: {vuln['severity']} (CVSS: {vuln['cvss_score']})\n")
+                            f.write(f"  Description: {vuln['description']}\n")
+                            f.write(f"  Remediation: {vuln['remediation']}\n")
                             
-                            vuln_data.append([
-                                vuln['cve_id'],
-                                vuln['cvss_score'],
-                                vuln['severity'],
-                                description
-                            ])
-                        
-                        f.write(tabulate(vuln_data, headers=["CVE ID", "CVSS Score", "Severity", "Description"], tablefmt="pretty") + "\n")
+                            # FIXED: Include exploits in text report
+                            if vuln['exploits']:
+                                f.write(f"  Available Exploits ({len(vuln['exploits'])}):\n")
+                                for i, exploit in enumerate(vuln['exploits'], 1):
+                                    f.write(f"    {i}. {exploit['name']}\n")
+                                    f.write(f"       Path: {exploit['path']}\n")
+                                    if exploit.get('type') != 'Unknown':
+                                        f.write(f"       Type: {exploit['type']}\n")
+                            else:
+                                f.write("  No public exploits found\n")
+                            f.write("\n")
                 
-                if not vuln_found:
-                    f.write("No vulnerabilities found for any service.\n")
+                if not cve_found:
+                    f.write("No CVE vulnerabilities found for any service.\n")
                 
-                # Restore stdout
-                sys.stdout = original_stdout
+                # FIXED: OWASP vulnerabilities
+                if self.enable_owasp and self.web_vulnerabilities:
+                    f.write("\nOWASP TOP 10 VULNERABILITIES:\n")
+                    for vuln in self.web_vulnerabilities:
+                        f.write(f"\n[{vuln['severity']}] {vuln['type']}\n")
+                        f.write(f"  URL: {vuln['url']}\n")
+                        f.write(f"  Parameter: {vuln['parameter']}\n")
+                        f.write(f"  Payload: {vuln['payload']}\n")
+                        f.write(f"  Evidence: {vuln['evidence']}\n")
+                        f.write(f"  Remediation: {vuln['remediation']}\n")
+                elif self.enable_owasp:
+                    f.write("\nNo OWASP vulnerabilities found.\n")
+                    
         except Exception as e:
             raise Exception(f"Error saving TXT report: {str(e)}")
     
     def save_json_report(self, output_file):
-        """Save the scan report in JSON format"""
+        """FIXED: Save the scan report in JSON format with exploits"""
         try:
             report = {
                 "scan_info": {
@@ -444,11 +572,14 @@ class VulnerabilityScanner:
                     "end_time": self.scan_end_time.strftime("%Y-%m-%d %H:%M:%S"),
                     "duration": (self.scan_end_time - self.scan_start_time).total_seconds(),
                     "ports_scanned": self.ports,
-                    "open_ports_count": len(self.open_ports)
+                    "open_ports_count": len(self.open_ports),
+                    "owasp_enabled": self.enable_owasp
                 },
                 "open_ports": self.open_ports,
                 "services": self.service_info,
-                "vulnerabilities": self.vulnerabilities
+                "cve_vulnerabilities": self.vulnerabilities,
+                "service_exploits": getattr(self, 'service_exploits', {}),  # FIXED: Include service exploits
+                "web_vulnerabilities": self.web_vulnerabilities
             }
             
             with open(output_file, 'w') as f:
@@ -457,7 +588,7 @@ class VulnerabilityScanner:
             raise Exception(f"Error saving JSON report: {str(e)}")
     
     def save_html_report(self, output_file):
-        """Save the scan report in HTML format"""
+        """FIXED: Save the scan report in HTML format with exploits"""
         try:
             scan_duration = (self.scan_end_time - self.scan_start_time).total_seconds()
             
@@ -466,18 +597,23 @@ class VulnerabilityScanner:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Vulnerability Scan Report - {self.target}</title>
+    <title>RED ALERT CLI - Vulnerability Scan Report - {self.target}</title>
     <style>
         body {{
-            font-family: Arial, sans-serif;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             line-height: 1.6;
             margin: 0;
             padding: 20px;
             color: #333;
+            background-color: #f5f5f5;
         }}
         .container {{
             max-width: 1200px;
             margin: 0 auto;
+            background-color: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.1);
         }}
         h1, h2, h3 {{
             color: #2c3e50;
@@ -485,14 +621,15 @@ class VulnerabilityScanner:
         h1 {{
             text-align: center;
             padding-bottom: 10px;
-            border-bottom: 2px solid #3498db;
+            border-bottom: 3px solid #e74c3c;
+            color: #e74c3c;
         }}
         .section {{
-            margin: 20px 0;
-            padding: 15px;
+            margin: 25px 0;
+            padding: 20px;
             background-color: #f9f9f9;
-            border-radius: 5px;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            border-radius: 8px;
+            border-left: 4px solid #3498db;
         }}
         table {{
             width: 100%;
@@ -505,11 +642,11 @@ class VulnerabilityScanner:
             border-bottom: 1px solid #ddd;
         }}
         th {{
-            background-color: #3498db;
+            background-color: #34495e;
             color: white;
         }}
         tr:nth-child(even) {{
-            background-color: #f2f2f2;
+            background-color: #f8f9fa;
         }}
         .severity-high {{
             color: #e74c3c;
@@ -527,52 +664,44 @@ class VulnerabilityScanner:
             color: #e74c3c;
             font-weight: bold;
         }}
-        .port-header {{
-            background-color: #34495e;
-            color: white;
+        .vuln-card {{
+            background-color: white;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 10px 0;
+            border-left: 4px solid #e74c3c;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }}
+        .owasp-card {{
+            border-left-color: #f39c12;
+        }}
+        .exploit-list {{
+            background-color: #f8f9fa;
             padding: 10px;
-            margin-top: 20px;
             border-radius: 5px;
+            margin: 10px 0;
         }}
         .footer {{
             text-align: center;
             margin-top: 30px;
-            font-size: 0.8em;
+            font-size: 0.9em;
             color: #7f8c8d;
+            border-top: 1px solid #ecf0f1;
+            padding-top: 20px;
         }}
-        .download-section {{
-            text-align: center;
-            margin: 20px 0;
-        }}
-        .download-btn {{
-            display: inline-block;
-            padding: 10px 20px;
-            background-color: #3498db;
-            color: white;
-            text-decoration: none;
-            border-radius: 5px;
+        .logo {{
+            color: #e74c3c;
             font-weight: bold;
-        }}
-        .download-btn:hover {{
-            background-color: #2980b9;
-        }}
-        @media print {{
-            .download-section {{
-                display: none;
-            }}
+            font-size: 1.2em;
         }}
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Vulnerability Scan Report</h1>
-        
-        <div class="download-section">
-            <button class="download-btn" onclick="window.print()">Print/Save as PDF</button>
-        </div>
+        <h1><span class="logo">🚨 RED ALERT CLI</span><br>Vulnerability Scan Report</h1>
         
         <div class="section">
-            <h2>Scan Information</h2>
+            <h2>📊 Scan Information</h2>
             <table>
                 <tr>
                     <th>Property</th>
@@ -602,6 +731,10 @@ class VulnerabilityScanner:
                     <td>Open Ports Found</td>
                     <td>{len(self.open_ports)}</td>
                 </tr>
+                <tr>
+                    <td>OWASP Scan</td>
+                    <td>{"Enabled" if self.enable_owasp else "Disabled"}</td>
+                </tr>
             </table>
         </div>
 """
@@ -609,14 +742,14 @@ class VulnerabilityScanner:
             if not self.open_ports:
                 html_content += """
         <div class="section">
-            <h2>Open Ports and Services</h2>
+            <h2>🔍 Open Ports and Services</h2>
             <p>No open ports found.</p>
         </div>
 """
             else:
                 html_content += """
         <div class="section">
-            <h2>Open Ports and Services</h2>
+            <h2>🔍 Open Ports and Services</h2>
             <table>
                 <tr>
                     <th>Port</th>
@@ -656,33 +789,21 @@ class VulnerabilityScanner:
         </div>
 """
                 
-                # Vulnerabilities section
+                # CVE vulnerabilities section with exploits
                 html_content += """
         <div class="section">
-            <h2>Vulnerabilities</h2>
+            <h2>🛡️ CVE Vulnerabilities</h2>
 """
                 
-                vuln_found = False
+                cve_found = False
                 for port in self.open_ports:
                     port_str = str(port)
                     if port_str in self.vulnerabilities and self.vulnerabilities[port_str]:
-                        vuln_found = True
+                        cve_found = True
                         service = self.service_info.get(port_str, {'name': 'Unknown', 'product': '', 'version': ''})
                         
                         html_content += f"""
-            <div class="port-header">
-                <h3>Port {port} - {html.escape(service['name'])} - {html.escape(service['product'])} {html.escape(service['version'])}</h3>
-            </div>
-              {html.escape(service['version'])}</h3>
-            </div>
-            
-            <table>
-                <tr>
-                    <th>CVE ID</th>
-                    <th>CVSS Score</th>
-                    <th>Severity</th>
-                    <th>Description</th>
-                </tr>
+            <h3>Port {port} - {html.escape(service['name'])} - {html.escape(service['product'])} {html.escape(service['version'])}</h3>
 """
                         
                         for vuln in self.vulnerabilities[port_str]:
@@ -693,41 +814,92 @@ class VulnerabilityScanner:
                                 severity_class = "severity-medium"
                             
                             html_content += f"""
-                <tr>
-                    <td class="cve-id">{html.escape(vuln['cve_id'])}</td>
-                    <td class="{severity_class}">{html.escape(str(vuln['cvss_score']))}</td>
-                    <td class="{severity_class}">{html.escape(vuln['severity'])}</td>
-                    <td>{html.escape(vuln['description'])}</td>
-                </tr>
+            <div class="vuln-card">
+                <h4 class="cve-id">{html.escape(vuln['cve_id'])}</h4>
+                <p><strong class="{severity_class}">Severity: {html.escape(vuln['severity'])} (CVSS: {html.escape(str(vuln['cvss_score']))})</strong></p>
+                <p><strong>Description:</strong> {html.escape(vuln['description'])}</p>
+                <p><strong>Remediation:</strong> {html.escape(vuln['remediation'])}</p>
 """
-                        
-                        html_content += """
-            </table>
+                            
+                            # FIXED: Include exploits in HTML report
+                            if vuln['exploits']:
+                                html_content += f"""
+                <div class="exploit-list">
+                    <p><strong>🔥 Available Exploits ({len(vuln['exploits'])}):</strong></p>
+                    <ul>
+"""
+                                for exploit in vuln['exploits']:
+                                    html_content += f"""
+                        <li>
+                            <strong>{html.escape(exploit['name'])}</strong><br>
+                            <small>Path: {html.escape(exploit['path'])}</small><br>
+                            <small>Type: {html.escape(exploit.get('type', 'Unknown'))}</small>
+                        </li>
+"""
+                                html_content += """
+                    </ul>
+                </div>
+"""
+                            else:
+                                html_content += """
+                <p><em>No public exploits found</em></p>
+"""
+                            
+                            html_content += """
+            </div>
 """
                 
-                if not vuln_found:
+                if not cve_found:
                     html_content += """
-            <p>No vulnerabilities found for any service.</p>
+            <p>✅ No CVE vulnerabilities found for any service.</p>
 """
                 
                 html_content += """
+        </div>
+"""
+                
+                # OWASP vulnerabilities section
+                if self.enable_owasp:
+                    html_content += """
+        <div class="section">
+            <h2>🌐 OWASP Top 10 Vulnerabilities</h2>
+"""
+                    
+                    if self.web_vulnerabilities:
+                        for vuln in self.web_vulnerabilities:
+                            severity_class = "severity-low"
+                            if vuln['severity'] == 'HIGH':
+                                severity_class = "severity-high"
+                            elif vuln['severity'] == 'MEDIUM':
+                                severity_class = "severity-medium"
+                            
+                            html_content += f"""
+            <div class="vuln-card owasp-card">
+                <h4 class="{severity_class}">[{html.escape(vuln['severity'])}] {html.escape(vuln['type'])}</h4>
+                <p><strong>URL:</strong> {html.escape(vuln['url'])}</p>
+                <p><strong>Parameter:</strong> {html.escape(vuln['parameter'])}</p>
+                <p><strong>Payload:</strong> <code>{html.escape(vuln['payload'])}</code></p>
+                <p><strong>Evidence:</strong> {html.escape(vuln['evidence'])}</p>
+                <p><strong>Remediation:</strong> {html.escape(vuln['remediation'])}</p>
+            </div>
+"""
+                    else:
+                        html_content += """
+            <p>✅ No OWASP vulnerabilities found.</p>
+"""
+                    
+                    html_content += """
         </div>
 """
             
             # Footer
             html_content += f"""
         <div class="footer">
-            <p>Report generated on {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")} by RED ALERT CLI Vulnerability Scanner</p>
+            <p class="logo">🚨 RED ALERT CLI</p>
+            <p>Comprehensive Vulnerability Scanner for Cybersecurity Professionals</p>
+            <p>Report generated on {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
         </div>
     </div>
-    
-    <script>
-        // Add event listener for download button
-        document.addEventListener('DOMContentLoaded', function() {{
-            // This script enables the print/save functionality
-            console.log('Report loaded successfully');
-        }});
-    </script>
 </body>
 </html>
 """
@@ -743,22 +915,23 @@ def print_banner():
     banner = f"""
 {Fore.RED}
 ==================================================
- ____  _____ ____     _    _     _____ ____ _____ 
-|  _ \| ____|  _ \   / \  | |   | ____|  _ \_   _|
-| |_) |  _| | | | | / _ \ | |   |  _| | |_) || |  
-|  _ <| |___| |_| |/ ___ \| |___| |___|  _ < | |  
-|_| \_\_____|____/_/   \_\_____|_____||_| \_\|_|  
+ ____  _____ ____     _    _     _____ ____  _____ 
+|  _ \| ____|  _ \   / \  | |   | ____|  _ \|_   _|
+| |_) |  _| | | | | / _ \ | |   |  _| | |_) | | |  
+|  _ <| |___| |_| |/ ___ \| |___| |___|  _ <  | |  
+|_| \_\_____|____//_/   \_\_____|_____||_| \_\|_|  
 ==================================================                   
                                                             
 {Style.RESET_ALL}
 """
     print(banner)
-    print(f"{Fore.YELLOW}A comprehensive vulnerability scanning tool{Style.RESET_ALL}")
-    print(f"{Fore.YELLOW}Version 1.2.0{Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}🚨 Enhanced Vulnerability Scanner for Cybersecurity Professionals{Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}🇮🇳 Made by Rohit Kol for Ethical Hackers & Bug Bounty Hunters{Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}Version 2.0.0 : OWASP Detection + Exploit Listing{Style.RESET_ALL}")
     print("=" * 80)
 
 def main():
-    parser = argparse.ArgumentParser(description='Vulnerability Scanner')
+    parser = argparse.ArgumentParser(description='RED ALERT CLI - Enhanced Vulnerability Scanner')
     parser.add_argument('target', help='Target IP address or hostname')
     parser.add_argument('-p', '--ports', default='1-1000', help='Port range to scan (e.g., 1-1000 or 22,80,443)')
     parser.add_argument('-t', '--threads', type=int, default=10, help='Number of threads for scanning')
@@ -766,6 +939,7 @@ def main():
     parser.add_argument('-o', '--output', help='Output file to save the report')
     parser.add_argument('-f', '--format', choices=['txt', 'json', 'html'], default='txt', 
                         help='Report format (txt, json, or html)')
+    parser.add_argument('--owasp', action='store_true', help='Enable OWASP Top 10 vulnerability scanning for web services')
     
     args = parser.parse_args()
     
@@ -775,7 +949,8 @@ def main():
         target=args.target,
         ports=args.ports,
         threads=args.threads,
-        timeout=args.timeout
+        timeout=args.timeout,
+        enable_owasp=args.owasp
     )
     
     scanner.run_scan()
@@ -786,6 +961,7 @@ def main():
     else:
         print(f"\n{Fore.YELLOW}[!] No output file specified. Report not saved.{Style.RESET_ALL}")
         print(f"{Fore.YELLOW}[!] Use -o/--output option to save the report.{Style.RESET_ALL}")
+        print(f"{Fore.BLUE}[*] Example: python3 RED_ALERT_CLI.py {args.target} --owasp -o report.html -f html{Style.RESET_ALL}")
 
 if __name__ == "__main__":
     main()
