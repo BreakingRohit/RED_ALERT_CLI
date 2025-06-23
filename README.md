@@ -72,7 +72,7 @@ python3 RED_ALERT_CLI.py target.com --owasp -o report.html -f html
 
 * **TXT** – Clean CLI-style summary
 * **JSON** – For integration/automation
-* **HTML** – Professional styled report (print/PDF friendly)
+* **HTML** – Professional styled report 
 
 ---
 
