@@ -221,8 +221,8 @@ We welcome contributions from the cybersecurity community! Here's how you can he
 
 ### Development Setup
 \`\`\`bash
-git clone https://github.com/yourusername/red-alert-cli.git
-cd red-alert-cli
+git clone https://github.com/BreakingRohit/RED_ALERT_CLI.git
+cd RED_ALERT_CLI
 pip3 install -r requirements.txt
 python3 -m pytest tests/  # Run tests
 \`\`\`
